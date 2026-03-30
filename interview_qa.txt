@@ -1,0 +1,494 @@
+Project Q&A
+
+1. What did you build?
+A full-stack board hierarchy manager with an Express + PostgreSQL backend and a Next.js + React frontend. It supports nested boards, move/create/delete operations, a max depth rule, realtime sync across tabs, a seed wizard, Dockerized local setup, and backend integration tests.
+
+2. What is the core data model?
+A single boards table using an adjacency-list structure:
+- id
+- name
+- parent_id nullable self-reference
+- created_at
+- updated_at
+
+Why this model:
+- simple to reason about
+- easy writes for create/move/delete
+- works well with Postgres recursive CTEs
+
+Tradeoff:
+- tree reads and validation need recursive queries
+
+3. Why did you choose adjacency list?
+Because it is the simplest correct model for a hierarchy challenge and keeps the schema small.
+
+Tradeoffs:
+- Pros: simple schema, easy moves, easy inserts
+- Cons: recursive reads are more expensive than some alternative models
+
+4. Why PostgreSQL?
+Because it fits a collaborative production-style app better than an embedded DB and supports recursive CTEs well.
+
+Tradeoffs:
+- Pros: strong SQL support, good recursion, realistic production signal
+- Cons: more setup than SQLite
+
+5. Why raw SQL instead of an ORM?
+Because the most important logic is recursive hierarchy traversal, and raw SQL expresses that more clearly than an ORM.
+
+Tradeoffs:
+- Pros: explicit, efficient, easier to reason about recursive queries
+- Cons: more handwritten SQL, less abstraction/portability
+
+6. What does the parent_id index do, and why is it important?
+It speeds up parent-to-children traversal, which is the hottest access pattern in a tree.
+
+Why:
+- descendant queries repeatedly join on b.parent_id = subtree.id
+- child lookups depend on parent_id
+
+Tradeoff:
+- it helps traversal a lot, but does not solve full-tree fetch cost by itself
+
+7. What are recursive CTEs, and why did you use them?
+Recursive CTEs let SQL walk up or down a tree structure. I used them for depth calculation, subtree height, descendant checks, and subtree ID collection.
+
+Why:
+- hierarchy logic is naturally recursive
+- keeps tree validation in the database query layer
+
+8. What does getBoardDepth do?
+It walks upward from a board to the root and returns that board's level in the hierarchy.
+
+Example:
+- root = 1
+- child = 2
+- grandchild = 3
+
+Used for:
+- validating create under a parent
+- validating move destination
+- returning board depth to the API
+
+9. What does getSubtreeHeight do?
+It walks downward from a board to its deepest descendant and returns the subtree's height.
+
+Example:
+- board with no children = 1
+- board with child and grandchild = 3
+
+Used for:
+- move validation, because moving a board also moves all descendants
+
+10. What is the difference between getBoardDepth and getSubtreeHeight?
+- getBoardDepth: upward traversal, "How deep is this node from the root?"
+- getSubtreeHeight: downward traversal, "How tall is the subtree rooted here?"
+
+Why both matter:
+- move validation needs destination depth + moved subtree height
+
+11. Why is getSubtreeHeight necessary during move?
+Because a move affects the entire branch, not just the moved board. A node may fit under a parent, but its deepest descendant might exceed the max depth after the move.
+
+12. How is max depth enforced?
+In the service layer, not in the database.
+
+Create rule:
+- parent depth + 1 must be <= max
+
+Move rule:
+- destination parent depth + subtree height must be <= max
+
+Tradeoff:
+- simpler implementation
+- but not as strong as DB-enforced validation under concurrency
+
+13. Why is not max depth enforced with a DB constraint?
+Because normal CHECK constraints are row-local, while hierarchy depth depends on other rows.
+
+Production alternatives:
+- trigger
+- stored procedure-only writes
+- different hierarchy model
+
+Tradeoff:
+- DB enforcement is stronger
+- but adds complexity
+
+14. How would you enforce max depth in the DB if needed?
+I'd likely use a trigger on insert/update of parent_id to compute resulting depth and reject invalid writes.
+
+15. How does delete work?
+The app first gathers all descendant IDs, then deletes the selected board. The database cascades deletion through children because parent_id has ON DELETE CASCADE.
+
+Why this is good:
+- the database guarantees structural integrity
+- app can still return deletedIds for UX
+
+16. How does move validation prevent bad states?
+It checks:
+- board exists
+- destination exists
+- cannot move into itself
+- cannot move into a descendant
+- resulting depth cannot exceed max
+
+17. What race-condition risks exist today?
+Move/create checks are read-validate-write without explicit locking, so concurrent structural changes can race.
+
+Example:
+- two users move the same subtree at once
+- both validate against stale state
+- last write wins
+
+Tradeoff:
+- okay for a challenge/demo
+- not enough for high-contention production use
+
+18. How would you improve concurrency handling?
+Options:
+- transaction + SELECT ... FOR UPDATE
+- stronger isolation like SERIALIZABLE
+- optimistic concurrency with a version field or updated_at check
+
+19. What happens if two people move the same tree to different roots at the same time?
+Most likely:
+- both requests validate
+- both updates succeed
+- the last committed update becomes the final state
+
+That is a classic lost update problem.
+
+20. How does the frontend manage state?
+Two layers:
+- TanStack Query for server state
+- Redux Toolkit for UI-only state
+
+Query is used for:
+- board tree fetch
+- mutations
+- invalidation/refetch
+
+Redux is used for:
+- selected board
+- expanded rows
+- modal state
+- seed wizard step/form state
+
+Why this split:
+- remote data and UI interaction state have different lifecycles
+
+21. Why use both React Query and Redux? Why not one?
+Because they solve different problems well.
+
+React Query:
+- caching, fetching, invalidation, async state
+
+Redux:
+- local UI state shared across components
+
+Tradeoff:
+- slightly more architecture
+- but cleaner separation of concerns
+
+22. How does realtime sync work right now?
+Backend emits Socket.IO events after create/move/delete/seed. Frontend listens and invalidates the board tree query, then refetches.
+
+Why it is good:
+- simple
+- reliable
+- backend remains source of truth
+
+Tradeoff:
+- every change causes a refetch
+- not very selective at scale
+
+23. Do you use Socket.IO rooms right now?
+No. The app currently uses global broadcast via io.emit(...).
+
+That means:
+- every connected socket receives every board event
+- there are no rooms
+- there is no socket auth
+- there is no workspace scoping
+
+24. What does it mean that socket events are global and not auth-scoped?
+It means all connected clients hear all events, regardless of identity or permissions.
+
+Why that is okay here:
+- single shared demo app
+- no user/workspace model in the challenge
+
+Why it is not okay for production:
+- no privacy boundary
+- wasted traffic
+- no tenant isolation
+
+25. What would be a better realtime design?
+Use authenticated, workspace-scoped rooms.
+
+Flow:
+- authenticate socket on connection
+- subscribe socket to active workspace room
+- emit events only to that workspace room
+
+Example:
+- room name like workspace:123
+- emit with io.to("workspace:123").emit(...)
+
+26. Who joins the socket to a room: frontend or backend?
+The backend does.
+
+Frontend can request subscription, but the backend must verify access and call socket.join(...).
+
+Why:
+- room membership is a permission decision
+- the client should not be trusted to self-assign access
+
+27. What does socket authentication mean?
+It means the server verifies the identity behind the realtime connection, usually during the handshake using a token or cookie.
+
+Authentication:
+- "Who is this socket?"
+
+Authorization:
+- "Which rooms is this socket allowed to join?"
+
+28. When should a socket join a room?
+Usually after connection auth, then either:
+- immediately for the current workspace
+- or on-demand when the user navigates into a workspace
+
+Good interview answer:
+- authenticate on connect
+- subscribe to active workspace as navigation changes
+
+29. Why was the current realtime approach still reasonable for the challenge?
+Because it optimized for correctness, simplicity, and demoability over advanced multi-tenant infrastructure.
+
+Tradeoff:
+- simple global invalidation is heavier than necessary
+- but much less error-prone than patching complex nested client state
+
+30. How would you improve the current realtime approach?
+- add socket auth
+- add workspace rooms
+- emit richer event payloads
+- invalidate only affected branches
+- re-sync after reconnect
+- potentially patch cache selectively for simple mutations
+
+31. How does Docker work in this project?
+docker-compose.yml runs:
+- PostgreSQL
+- backend
+- frontend
+
+Flow:
+- Postgres starts with a health check
+- backend waits for healthy DB
+- backend runs migrations on startup
+- frontend proxies /api/* to backend through a Next.js rewrite
+- Socket.IO connects directly to backend via NEXT_PUBLIC_WS_URL
+
+32. Why does the frontend use a rewrite for HTTP but direct URL for sockets?
+Because standard API requests can be proxied by Next.js rewrites, but Socket.IO typically connects directly to the backend server.
+
+33. How would you improve getAllBoards?
+A composite index on sort columns could help some cases, but the bigger improvement is reducing full-tree fetches.
+
+Better long-term improvements:
+- roots endpoint
+- children endpoint
+- subtree endpoint
+- lazy loading
+- pagination per parent
+
+34. Why do full-tree fetches become expensive?
+Because as data grows:
+- payloads get large
+- every change re-fetches everything
+- rebuilding the tree becomes more expensive
+- users often only need one small branch at a time
+
+35. What does lazy loading mean here?
+Instead of fetching the entire tree at once:
+- fetch roots first
+- when user expands a board, fetch its children
+- continue loading deeper branches on demand
+
+Tradeoff:
+- much better performance at scale
+- more frontend complexity
+
+36. How would you paginate a hierarchy?
+Paginate siblings per parent, not the whole nested tree.
+
+Examples:
+- roots paginated
+- children of a given board paginated
+
+Why:
+- tree UI is naturally branch-based
+- global tree pagination is awkward
+
+37. What hierarchy alternatives did you consider conceptually?
+- adjacency list
+- materialized path
+- closure table
+
+38. What is adjacency list?
+Each node stores only its direct parent.
+
+Pros:
+- simplest model
+- easy writes
+
+Cons:
+- recursive reads required
+
+39. What is materialized path?
+Each node stores its full ancestry path.
+
+Example:
+- /root/marketing/campaigns/
+
+Pros:
+- descendant checks and subtree reads are simpler
+- depth often easy to derive
+
+Cons:
+- moving a subtree requires rewriting paths for all descendants
+
+Good fit:
+- read-heavy trees
+- less frequent moves
+
+40. What is closure table?
+A separate table stores every ancestor-descendant relationship.
+
+Pros:
+- fast and flexible tree reads
+- ancestor/descendant queries are easy
+
+Cons:
+- writes and moves become much more complex
+- more storage
+
+Good fit:
+- very read-heavy, query-heavy hierarchy systems
+
+41. Why did you not use materialized path or closure table here?
+Because adjacency list was the simplest model that met the challenge requirements cleanly.
+
+Tradeoff framing:
+- challenge prioritized correctness and clarity over advanced hierarchy optimization
+
+42. Is materialized path the same thing as a materialized view?
+No.
+
+Materialized path:
+- tree modeling technique
+
+Materialized view:
+- stored result of a query for performance
+
+Completely different concepts.
+
+43. If you moved to materialized path, what would change?
+Reads would get easier, moves would get more expensive.
+
+Would simplify:
+- descendant lookup
+- ancestor checks
+- depth calculation
+
+Would complicate:
+- moving a subtree, because every descendant path must be rewritten
+
+44. How would you support max depth 30+?
+At the backend level, very easily: the current logic already supports dynamic depth checks.
+
+What changes:
+- increase max depth constant
+
+What becomes more important:
+- UI usability
+- lazy loading
+- search/breadcrumbs
+- performance for larger trees
+
+So the real scaling issue is not just the number 30, it is how large and active the hierarchy becomes.
+
+45. If the requirement became depth 30+, would you change the model immediately?
+Not necessarily. For depth 30 alone, adjacency list with recursive CTEs is still reasonable. I'd first improve fetching strategy and indexing before changing hierarchy models.
+
+46. How would you scale this system generally?
+First steps:
+- add workspace_id
+- scope all queries by workspace
+- add composite indexes like (workspace_id, parent_id)
+- use lazy loading / child-list endpoints
+- add socket room scoping
+- improve concurrency control
+
+Later, if needed:
+- partition by workspace
+- move to materialized path or closure table if read patterns demand it
+
+47. How would you shard or partition this?
+The natural boundary is workspace/tenant.
+
+Best first step:
+- add workspace_id everywhere relevant
+
+Then:
+- logically isolate by workspace
+- optionally partition table by workspace hash/bucket
+- only consider deeper sharding later if scale truly requires it
+
+48. How would you add auth, workspaces, and permissions cleanly?
+Schema:
+- workspaces
+- workspace_memberships
+- boards.workspace_id
+
+Backend:
+- auth middleware identifies user
+- service queries scoped by workspace
+- membership/role checks on all reads/writes
+
+Sockets:
+- authenticate on connect
+- subscribe to authorized workspace rooms only
+- emit only to those rooms
+
+49. What tests do you have?
+Backend integration tests cover:
+- create root/child
+- invalid parent
+- max depth rejection
+- tree retrieval
+- valid/invalid moves
+- recursive delete
+- seed endpoint
+
+Frontend tests cover:
+- tree rendering/actions
+- seed wizard progression
+
+50. What are the biggest tradeoffs in the current solution?
+- max depth is enforced in app logic, not DB
+- no row locking for concurrent structural edits
+- global socket broadcast, no auth/workspace scoping
+- full-tree refetch on changes
+- no auth/permissions model yet
+
+51. Why are those acceptable tradeoffs for the challenge?
+Because the challenge rewards a clear, working, thoughtfully designed system more than a fully productionized platform. The current solution demonstrates good domain modeling, backend correctness, frontend separation of concerns, tests, and a realistic path to scale.
+
+52. What is your best "future improvements" answer?
+"I'd add workspace scoping first, because it improves scale, auth, query design, and realtime architecture all at once. Then I'd move from full-tree fetches to lazy-loaded branch reads, add transactional concurrency protection for structural writes, and scope sockets by authenticated workspace rooms."
+
+53. What is your best one-minute architecture summary?
+"The backend uses a single self-referential Postgres table and recursive SQL to enforce hierarchy rules like max depth, cycle prevention, and subtree-aware moves. Business logic lives in a service layer, and the API stays thin. On the frontend, TanStack Query manages server state while Redux manages UI-only interaction state like expansion and modals. Realtime sync uses Socket.IO as a change signal, and the UI revalidates against the backend as the source of truth. It's a deliberately simple architecture with a clear path toward workspace scoping, lazy loading, and room-based realtime as the product scales."
